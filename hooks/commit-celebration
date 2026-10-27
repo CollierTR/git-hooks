@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# post-commit — celebrate a successful commit.
+#
+# Git runs this after the commit object exists. A non-zero exit does not
+# undo the commit, but keep this hook fail-open anyway so it never
+# surprises you in scripts or CI.
+#
+# Stub ideas:
+#   - swap the terminal burst for a desktop notification
+#   - skip on certain commit messages (e.g. "wip")
+
+set -u
+trap 'exit 0' EXIT
+
+subject="$(git log -1 --pretty=%s 2>/dev/null || true)"
+
+script_path="${BASH_SOURCE[0]}"
+if script_realpath="$(readlink -f "$script_path" 2>/dev/null)" && [[ -n "$script_realpath" ]]; then
+  script_path="$script_realpath"
+fi
+script_dir="$(cd "$(dirname -- "$script_path")" && pwd)"
+chime="${script_dir}/assets/chime.mp3"
+
+play_chime() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  # Don't honk at CI runners.
+  if [[ -n "${CI:-}" || -n "${GITHUB_ACTIONS:-}" || -n "${GITLAB_CI:-}" || -n "${JENKINS_URL:-}" ]]; then
+    return 0
+  fi
+
+  if command -v pw-play >/dev/null 2>&1; then
+    nohup pw-play "$file" >/dev/null 2>&1 &
+  elif command -v paplay >/dev/null 2>&1; then
+    nohup paplay "$file" >/dev/null 2>&1 &
+  elif command -v ffplay >/dev/null 2>&1; then
+    nohup ffplay -nodisp -autoexit -loglevel quiet "$file" >/dev/null 2>&1 &
+  elif command -v mpv >/dev/null 2>&1; then
+    nohup mpv --no-video --really-quiet "$file" >/dev/null 2>&1 &
+  elif command -v mpg123 >/dev/null 2>&1; then
+    nohup mpg123 -q "$file" >/dev/null 2>&1 &
+  elif command -v powershell.exe >/dev/null 2>&1 && command -v wslpath >/dev/null 2>&1; then
+    # WSL: play the MP3 through Windows MCI so we don't need a Linux audio stack.
+    local win_path
+    win_path="$(wslpath -w "$file" 2>/dev/null || true)"
+    [[ -n "$win_path" ]] || return 0
+    printf '%s\n' "$win_path" | nohup powershell.exe -NoProfile -WindowStyle Hidden -Command '
+      $path = [Console]::In.ReadLine()
+      if ([string]::IsNullOrWhiteSpace($path)) { exit 0 }
+      Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public class WinMM {
+  [DllImport("winmm.dll")]
+  public static extern int mciSendString(string command, StringBuilder buffer, int bufferSize, IntPtr hwndCallback);
+}
+"@
+      [void][WinMM]::mciSendString("open `"$path`" type mpegvideo alias gitChime", $null, 0, [IntPtr]::Zero)
+      [void][WinMM]::mciSendString("play gitChime wait", $null, 0, [IntPtr]::Zero)
+      [void][WinMM]::mciSendString("close gitChime", $null, 0, [IntPtr]::Zero)
+    ' >/dev/null 2>&1 &
+  else
+    return 0
+  fi
+  disown $! 2>/dev/null || true
+}
+
+play_chime "$chime"
+
+if [[ ! -t 1 ]]; then
+  printf '🎉 committed'
+  if [[ -n "$subject" ]]; then
+    printf ' — %s' "$subject"
+  fi
+  printf '\n'
+  exit 0
+fi
+
+colors=(31 32 33 34 35 36 91 92 93 95 96)
+chars=('*' '+' '.' 'o' '•' '✦' '✧' '★')
+cols="$(tput cols 2>/dev/null || echo 80)"
+frames=8
+rows=6
+
+hide_cursor=$'\033[?25l'
+show_cursor=$'\033[?25h'
+up_rows=$'\033['"$rows"'A'
+
+printf '%s' "$hide_cursor"
+
+burst() {
+  local r c color char
+  for ((r = 0; r < rows; r++)); do
+    for ((c = 0; c < cols; c++)); do
+      if ((RANDOM % 7 == 0)); then
+        color="${colors[RANDOM % ${#colors[@]}]}"
+        char="${chars[RANDOM % ${#chars[@]}]}"
+        printf '\033[%sm%s\033[0m' "$color" "$char"
+      else
+        printf ' '
+      fi
+    done
+    printf '\n'
+  done
+}
+
+for ((frame = 0; frame < frames; frame++)); do
+  burst
+  if ((frame < frames - 1)); then
+    printf '%s' "$up_rows"
+    sleep 0.06
+  fi
+done
+
+printf '%s' "$show_cursor"
+printf '\n\033[1;95m  🎉  committed\033[0m'
+if [[ -n "$subject" ]]; then
+  printf '\033[0;96m  — %s\033[0m' "$subject"
+fi
+printf '\n\n'
